@@ -10,7 +10,7 @@ class Database {
             fs.mkdirSync(dataDir, { recursive: true });
         }
 
-        this.db = new sqlite3.Database(path.join(dataDir, 'business.db'));
+        this.db = new sqlite3.Database(path.join(dataDir, 'stocks.db'));
         this.init();
     }
 
@@ -20,45 +20,44 @@ class Database {
                 CREATE TABLE IF NOT EXISTS users (
                     id TEXT PRIMARY KEY,
                     username TEXT NOT NULL,
-                    money REAL DEFAULT 1000.0,
+                    cash REAL DEFAULT 1000.0,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             `);
 
             this.db.run(`
-                CREATE TABLE IF NOT EXISTS market_rounds (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    round_number INTEGER NOT NULL,
-                    market_mood TEXT DEFAULT 'normal',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            `);
-
-            this.db.run(`
-                CREATE TABLE IF NOT EXISTS investments (
+                CREATE TABLE IF NOT EXISTS holdings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL,
-                    round_id INTEGER NOT NULL,
-                    type TEXT NOT NULL,
                     symbol TEXT NOT NULL,
-                    amount REAL NOT NULL,
-                    multiplier REAL,
-                    settled BOOLEAN DEFAULT FALSE,
+                    quantity REAL NOT NULL,
+                    avg_price REAL NOT NULL,
+                    is_short BOOLEAN DEFAULT FALSE,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (id),
-                    FOREIGN KEY (round_id) REFERENCES market_rounds (id)
+                    FOREIGN KEY (user_id) REFERENCES users (id)
                 )
             `);
 
             this.db.run(`
-                CREATE TABLE IF NOT EXISTS market_options (
+                CREATE TABLE IF NOT EXISTS transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    round_id INTEGER NOT NULL,
-                    type TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
                     symbol TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    multiplier REAL NOT NULL,
-                    FOREIGN KEY (round_id) REFERENCES market_rounds (id)
+                    type TEXT NOT NULL, -- 'buy', 'sell', 'short', 'cover'
+                    quantity REAL NOT NULL,
+                    price REAL NOT NULL,
+                    total_value REAL NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            `);
+
+            this.db.run(`
+                CREATE TABLE IF NOT EXISTS stock_cache (
+                    symbol TEXT PRIMARY KEY,
+                    price REAL NOT NULL,
+                    change_percent REAL,
+                    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             `);
         });
@@ -73,9 +72,8 @@ class Database {
                 }
 
                 if (!row) {
-                    // Create new user with starting money of $1000
                     this.db.run(
-                        'INSERT INTO users (id, username, money) VALUES (?, ?, 1000.0)',
+                        'INSERT INTO users (id, username, cash) VALUES (?, ?, 1000.0)',
                         [userId, username],
                         (err) => {
                             if (err) reject(err);
@@ -83,7 +81,6 @@ class Database {
                         }
                     );
                 } else {
-                    // Update username in case it changed
                     this.db.run(
                         'UPDATE users SET username = ? WHERE id = ?',
                         [username, userId],
@@ -106,15 +103,11 @@ class Database {
         });
     }
 
-    async updateUser(userId, updates) {
+    async updateUserCash(userId, cashAmount) {
         return new Promise((resolve, reject) => {
-            const fields = Object.keys(updates);
-            const values = Object.values(updates);
-            const setClause = fields.map(field => `${field} = ?`).join(', ');
-            
             this.db.run(
-                `UPDATE users SET ${setClause} WHERE id = ?`,
-                [...values, userId],
+                'UPDATE users SET cash = ? WHERE id = ?',
+                [cashAmount, userId],
                 (err) => {
                     if (err) reject(err);
                     else resolve();
@@ -123,11 +116,11 @@ class Database {
         });
     }
 
-    async getAllUsersRanked() {
+    async getUserHoldings(userId) {
         return new Promise((resolve, reject) => {
             this.db.all(
-                'SELECT * FROM users ORDER BY money DESC',
-                [],
+                'SELECT * FROM holdings WHERE user_id = ? AND quantity != 0',
+                [userId],
                 (err, rows) => {
                     if (err) reject(err);
                     else resolve(rows || []);
@@ -136,37 +129,11 @@ class Database {
         });
     }
 
-    async createMarketRound(roundNumber, marketMood = 'normal') {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT INTO market_rounds (round_number, market_mood) VALUES (?, ?)',
-                [roundNumber, marketMood],
-                function(err) {
-                    if (err) reject(err);
-                    else resolve(this.lastID);
-                }
-            );
-        });
-    }
-
-    async addMarketOption(roundId, type, symbol, name, multiplier) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT INTO market_options (round_id, type, symbol, name, multiplier) VALUES (?, ?, ?, ?, ?)',
-                [roundId, type, symbol, name, multiplier],
-                (err) => {
-                    if (err) reject(err);
-                    else resolve();
-                }
-            );
-        });
-    }
-
-    async getCurrentRound() {
+    async getHolding(userId, symbol, isShort = false) {
         return new Promise((resolve, reject) => {
             this.db.get(
-                'SELECT * FROM market_rounds ORDER BY id DESC LIMIT 1',
-                [],
+                'SELECT * FROM holdings WHERE user_id = ? AND symbol = ? AND is_short = ?',
+                [userId, symbol, isShort],
                 (err, row) => {
                     if (err) reject(err);
                     else resolve(row);
@@ -175,24 +142,38 @@ class Database {
         });
     }
 
-    async getMarketOptions(roundId) {
+    async updateHolding(userId, symbol, quantity, avgPrice, isShort = false) {
         return new Promise((resolve, reject) => {
-            this.db.all(
-                'SELECT * FROM market_options WHERE round_id = ? ORDER BY type, symbol',
-                [roundId],
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows || []);
-                }
-            );
+            if (quantity === 0) {
+                // Remove holding if quantity is 0
+                this.db.run(
+                    'DELETE FROM holdings WHERE user_id = ? AND symbol = ? AND is_short = ?',
+                    [userId, symbol, isShort],
+                    (err) => {
+                        if (err) reject(err);
+                        else resolve();
+                    }
+                );
+            } else {
+                this.db.run(
+                    `INSERT OR REPLACE INTO holdings 
+                     (user_id, symbol, quantity, avg_price, is_short) 
+                     VALUES (?, ?, ?, ?, ?)`,
+                    [userId, symbol, quantity, avgPrice, isShort],
+                    (err) => {
+                        if (err) reject(err);
+                        else resolve();
+                    }
+                );
+            }
         });
     }
 
-    async addInvestment(userId, roundId, type, symbol, amount) {
+    async addTransaction(userId, symbol, type, quantity, price, totalValue) {
         return new Promise((resolve, reject) => {
             this.db.run(
-                'INSERT INTO investments (user_id, round_id, type, symbol, amount) VALUES (?, ?, ?, ?, ?)',
-                [userId, roundId, type, symbol, amount],
+                'INSERT INTO transactions (user_id, symbol, type, quantity, price, total_value) VALUES (?, ?, ?, ?, ?, ?)',
+                [userId, symbol, type, quantity, price, totalValue],
                 (err) => {
                     if (err) reject(err);
                     else resolve();
@@ -201,11 +182,11 @@ class Database {
         });
     }
 
-    async getUserInvestments(userId, roundId) {
+    async getUserTransactions(userId, limit = 10) {
         return new Promise((resolve, reject) => {
             this.db.all(
-                'SELECT * FROM investments WHERE user_id = ? AND round_id = ? AND settled = FALSE',
-                [userId, roundId],
+                'SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
+                [userId, limit],
                 (err, rows) => {
                     if (err) reject(err);
                     else resolve(rows || []);
@@ -214,27 +195,48 @@ class Database {
         });
     }
 
-    async getAllInvestments(roundId) {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                'SELECT i.*, u.username FROM investments i JOIN users u ON i.user_id = u.id WHERE i.round_id = ? AND i.settled = FALSE',
-                [roundId],
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows || []);
-                }
-            );
-        });
-    }
-
-    async settleInvestments(roundId) {
+    async cacheStockPrice(symbol, price, changePercent = null) {
         return new Promise((resolve, reject) => {
             this.db.run(
-                'UPDATE investments SET settled = TRUE WHERE round_id = ?',
-                [roundId],
+                'INSERT OR REPLACE INTO stock_cache (symbol, price, change_percent) VALUES (?, ?, ?)',
+                [symbol, price, changePercent],
                 (err) => {
                     if (err) reject(err);
                     else resolve();
+                }
+            );
+        });
+    }
+
+    async getCachedStockPrice(symbol) {
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                'SELECT * FROM stock_cache WHERE symbol = ? AND datetime(last_updated) > datetime("now", "-5 minutes")',
+                [symbol],
+                (err, row) => {
+                    if (err) reject(err);
+                    else resolve(row);
+                }
+            );
+        });
+    }
+
+    async getAllUsersWithPortfolioValue() {
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT u.*, 
+                        u.cash as cash_value,
+                        COALESCE(SUM(CASE WHEN h.is_short = 0 THEN h.quantity * sc.price ELSE 0 END), 0) as long_value,
+                        COALESCE(SUM(CASE WHEN h.is_short = 1 THEN h.quantity * (2 * h.avg_price - sc.price) ELSE 0 END), 0) as short_value
+                 FROM users u
+                 LEFT JOIN holdings h ON u.id = h.user_id AND h.quantity != 0
+                 LEFT JOIN stock_cache sc ON h.symbol = sc.symbol
+                 GROUP BY u.id
+                 ORDER BY (u.cash + COALESCE(SUM(CASE WHEN h.is_short = 0 THEN h.quantity * sc.price ELSE 0 END), 0) + COALESCE(SUM(CASE WHEN h.is_short = 1 THEN h.quantity * (2 * h.avg_price - sc.price) ELSE 0 END), 0)) DESC`,
+                [],
+                (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows || []);
                 }
             );
         });

@@ -1,7 +1,7 @@
 {
-  "name": "business-conductor",
+  "name": "stock-trader-bot",
   "version": "1.0.0",
-  "description": "Conducts Business - A Discord bot mini business game",
+  "description": "Real Stock Trading Discord Bot",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
@@ -9,7 +9,8 @@
   },
   "dependencies": {
     "discord.js": "^14.14.1",
-    "sqlite3": "^5.1.6"
+    "sqlite3": "^5.1.6",
+    "axios": "^1.6.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
