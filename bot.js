@@ -13,6 +13,7 @@ const stockAPI = new StockAPI(config.alpha_vantage_api_key);
 client.once('ready', async () => {
     console.log(`${client.user.tag} is ready for stock trading!`);
     console.log(`Bot is in ${client.guilds.cache.size} guilds`);
+    console.log('Note: Using Alpha Vantage API with demo fallback for rate limits');
     
     // Register slash commands
     const commands = [
@@ -158,6 +159,8 @@ async function getStockPrice(symbol) {
         await db.cacheStockPrice(symbol, stockData.price, stockData.changePercent);
         return stockData;
     } catch (error) {
+        // If API fails, the stockAPI will return demo data, so we shouldn't throw here
+        console.error(`API error for ${symbol}, but demo data should be provided`);
         throw new Error(`Could not fetch price for ${symbol}. Please check the symbol and try again.`);
     }
 }
@@ -170,11 +173,13 @@ async function handleBuy(interaction, userId) {
 
     try {
         const stockData = await getStockPrice(symbol);
-        const totalCost = stockData.price * quantity;
+        const stockCost = stockData.price * quantity;
+        const transactionFee = stockAPI.calculateTransactionFee(stockCost);
+        const totalCost = stockCost + transactionFee;
         
         const user = await db.getUser(userId);
         if (user.cash < totalCost) {
-            await interaction.editReply(`Insufficient funds! You need $${totalCost.toFixed(2)} but only have $${user.cash.toFixed(2)}.`);
+            await interaction.editReply(`Insufficient funds! You need $${totalCost.toFixed(2)} (including $${transactionFee.toFixed(2)} fee) but only have $${user.cash.toFixed(2)}.`);
             return;
         }
 
@@ -187,7 +192,7 @@ async function handleBuy(interaction, userId) {
         
         if (existingHolding) {
             const totalShares = existingHolding.quantity + quantity;
-            const totalValue = (existingHolding.quantity * existingHolding.avg_price) + totalCost;
+            const totalValue = (existingHolding.quantity * existingHolding.avg_price) + stockCost;
             newQuantity = totalShares;
             newAvgPrice = totalValue / totalShares;
         } else {
@@ -198,6 +203,9 @@ async function handleBuy(interaction, userId) {
         await db.updateHolding(userId, symbol, newQuantity, newAvgPrice, false);
         await db.addTransaction(userId, symbol, 'buy', quantity, stockData.price, totalCost);
 
+        // Get random haiku
+        const haiku = stockAPI.getRandomHaiku();
+
         const embed = new EmbedBuilder()
             .setColor('#00ff00')
             .setTitle('✅ Buy Order Executed')
@@ -205,8 +213,11 @@ async function handleBuy(interaction, userId) {
                 { name: 'Stock', value: symbol, inline: true },
                 { name: 'Quantity', value: quantity.toString(), inline: true },
                 { name: 'Price', value: `$${stockData.price.toFixed(2)}`, inline: true },
+                { name: 'Stock Cost', value: `$${stockCost.toFixed(2)}`, inline: true },
+                { name: 'Transaction Fee (0.02%)', value: `$${transactionFee.toFixed(2)}`, inline: true },
                 { name: 'Total Cost', value: `$${totalCost.toFixed(2)}`, inline: true },
-                { name: 'Remaining Cash', value: `$${(user.cash - totalCost).toFixed(2)}`, inline: true }
+                { name: 'Remaining Cash', value: `$${(user.cash - totalCost).toFixed(2)}`, inline: false },
+                { name: '🌸 Trading Wisdom', value: `*${haiku}*`, inline: false }
             );
 
         await interaction.editReply({ embeds: [embed] });
@@ -215,7 +226,6 @@ async function handleBuy(interaction, userId) {
     }
 }
 
-// Placeholder functions for other commands
 async function handleSell(interaction, userId) {
     const symbol = interaction.options.getString('symbol').toUpperCase();
     const quantity = interaction.options.getNumber('quantity');
@@ -230,7 +240,9 @@ async function handleSell(interaction, userId) {
         }
 
         const stockData = await getStockPrice(symbol);
-        const totalRevenue = stockData.price * quantity;
+        const stockRevenue = stockData.price * quantity;
+        const transactionFee = stockAPI.calculateTransactionFee(stockRevenue);
+        const totalRevenue = stockRevenue - transactionFee;
         
         const user = await db.getUser(userId);
         await db.updateUserCash(userId, user.cash + totalRevenue);
@@ -240,9 +252,12 @@ async function handleSell(interaction, userId) {
         await db.updateHolding(userId, symbol, newQuantity, holding.avg_price, false);
         await db.addTransaction(userId, symbol, 'sell', quantity, stockData.price, totalRevenue);
 
-        const profit = (stockData.price - holding.avg_price) * quantity;
+        const profit = (stockData.price - holding.avg_price) * quantity - transactionFee;
         const profitColor = profit >= 0 ? '#00ff00' : '#ff0000';
         const profitEmoji = profit >= 0 ? '📈' : '📉';
+
+        // Get random haiku
+        const haiku = stockAPI.getRandomHaiku();
 
         const embed = new EmbedBuilder()
             .setColor(profitColor)
@@ -251,9 +266,12 @@ async function handleSell(interaction, userId) {
                 { name: 'Stock', value: symbol, inline: true },
                 { name: 'Quantity', value: quantity.toString(), inline: true },
                 { name: 'Price', value: `$${stockData.price.toFixed(2)}`, inline: true },
-                { name: 'Total Revenue', value: `$${totalRevenue.toFixed(2)}`, inline: true },
-                { name: `${profitEmoji} Profit/Loss`, value: `$${profit.toFixed(2)}`, inline: true },
-                { name: 'New Cash Balance', value: `$${(user.cash + totalRevenue).toFixed(2)}`, inline: true }
+                { name: 'Stock Revenue', value: `$${stockRevenue.toFixed(2)}`, inline: true },
+                { name: 'Transaction Fee (0.02%)', value: `$${transactionFee.toFixed(2)}`, inline: true },
+                { name: 'Net Revenue', value: `$${totalRevenue.toFixed(2)}`, inline: true },
+                { name: `${profitEmoji} Net Profit/Loss`, value: `$${profit.toFixed(2)}`, inline: true },
+                { name: 'New Cash Balance', value: `$${(user.cash + totalRevenue).toFixed(2)}`, inline: true },
+                { name: '🌸 Trading Wisdom', value: `*${haiku}*`, inline: false }
             );
 
         await interaction.editReply({ embeds: [embed] });
@@ -267,7 +285,19 @@ async function handlePrice(interaction) {
     await interaction.deferReply();
 
     try {
-        const stockData = await getStockPrice(symbol);
+        // Check if we're using cached data first
+        const cached = await db.getCachedStockPrice(symbol);
+        let stockData, isDemo = false;
+        
+        if (cached) {
+            stockData = cached;
+        } else {
+            // Try to get live data, but it might return demo data due to rate limits
+            stockData = await stockAPI.getStockPrice(symbol);
+            // Cache the result
+            await db.cacheStockPrice(symbol, stockData.price, stockData.changePercent);
+        }
+
         const changeColor = stockData.changePercent >= 0 ? '#00ff00' : '#ff0000';
         const changeEmoji = stockData.changePercent >= 0 ? '📈' : '📉';
 
@@ -278,6 +308,11 @@ async function handlePrice(interaction) {
                 { name: 'Current Price', value: `$${stockData.price.toFixed(2)}`, inline: true },
                 { name: `${changeEmoji} Daily Change`, value: `${stockData.changePercent >= 0 ? '+' : ''}${stockData.changePercent.toFixed(2)}%`, inline: true }
             )
+            .setFooter({ 
+                text: cached ? 
+                    'Transaction fee: 0.02% on all trades • Showing cached data' : 
+                    'Transaction fee: 0.02% on all trades • Live/Demo data'
+            })
             .setTimestamp();
 
         await interaction.editReply({ embeds: [embed] });
@@ -327,6 +362,7 @@ async function handlePortfolio(interaction, userId) {
         }
 
         embed.addFields({ name: 'Total Portfolio Value', value: `$${totalValue.toFixed(2)}`, inline: true });
+        embed.setFooter({ text: 'Note: Portfolio value excludes transaction fees already paid' });
 
         await interaction.editReply({ embeds: [embed] });
     } catch (error) {
@@ -360,7 +396,8 @@ async function handleBalance(interaction, userId) {
                 { name: 'Cash', value: `$${user.cash.toFixed(2)}`, inline: true },
                 { name: 'Portfolio Value', value: `$${portfolioValue.toFixed(2)}`, inline: true },
                 { name: 'Total Value', value: `$${totalValue.toFixed(2)}`, inline: true }
-            );
+            )
+            .setFooter({ text: 'Remember: 0.02% transaction fee applies to all trades' });
 
         await interaction.editReply({ embeds: [embed] });
     } catch (error) {
@@ -397,6 +434,7 @@ async function handleLeaderboard(interaction) {
         });
 
         embed.setDescription(description);
+        embed.setFooter({ text: 'Values shown are net worth after all transaction fees' });
         await interaction.editReply({ embeds: [embed] });
     } catch (error) {
         await interaction.editReply(`Error: ${error.message}`);
@@ -423,25 +461,67 @@ async function handleBrowse(interaction) {
             .setDescription('Browse stocks with live prices:');
 
         let stockText = '';
-        let processedCount = 0;
-        const maxStocks = 12; // Limit to avoid Discord message limits
+        let successCount = 0;
+        const maxStocks = 8; // Reduced to avoid rate limits
+        const targetStocks = stocks.slice(0, maxStocks);
 
-        for (const symbol of stocks.slice(0, maxStocks)) {
+        // First, try to get prices from cache
+        for (const symbol of targetStocks) {
+            try {
+                // Check cache first (more lenient timeout for browse)
+                const cached = await db.getCachedStockPrice(symbol);
+                if (cached && new Date() - new Date(cached.last_updated) < 300000) { // 5 minutes
+                    const changeEmoji = cached.change_percent >= 0 ? '📈' : '📉';
+                    const changeColor = cached.change_percent >= 0 ? '+' : '';
+                    stockText += `${changeEmoji} **${symbol}**: $${cached.price.toFixed(2)} (${changeColor}${cached.change_percent.toFixed(2)}%)\n`;
+                    successCount++;
+                }
+            } catch (error) {
+                console.error(`Error checking cache for ${symbol}:`, error);
+            }
+        }
+
+        // If we have some cached results, show them first
+        if (successCount > 0) {
+            embed.setDescription(stockText);
+            embed.setFooter({ 
+                text: `Showing ${successCount}/${targetStocks.length} stocks • Use /price <symbol> for live data • 0.02% fee applies`
+            });
+            await interaction.editReply({ embeds: [embed] });
+            return;
+        }
+
+        // If no cache hits, fetch a few live prices with proper delays
+        stockText = '🔄 *Fetching live prices...*\n\n';
+        let fetchedCount = 0;
+        const maxLiveFetches = 5; // Limit live API calls
+
+        for (const symbol of targetStocks.slice(0, maxLiveFetches)) {
             try {
                 const stockData = await getStockPrice(symbol);
                 const changeEmoji = stockData.changePercent >= 0 ? '📈' : '📉';
                 const changeColor = stockData.changePercent >= 0 ? '+' : '';
                 
                 stockText += `${changeEmoji} **${symbol}**: $${stockData.price.toFixed(2)} (${changeColor}${stockData.changePercent.toFixed(2)}%)\n`;
-                processedCount++;
+                fetchedCount++;
                 
-                // Add small delay to avoid rate limiting
-                if (processedCount % 3 === 0) {
-                    await new Promise(resolve => setTimeout(resolve, 100));
+                // Add longer delay to avoid rate limiting
+                if (fetchedCount < maxLiveFetches) {
+                    await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
                 }
             } catch (error) {
-                stockText += `❌ **${symbol}**: Price unavailable\n`;
+                console.error(`Error fetching price for ${symbol}:`, error.message);
+                stockText += `📊 **${symbol}**: Use \`/price ${symbol}\` for live data\n`;
             }
+        }
+
+        // Add remaining stocks as "use /price" suggestions
+        const remainingStocks = targetStocks.slice(maxLiveFetches);
+        if (remainingStocks.length > 0) {
+            stockText += `\n📈 **More ${categoryName} stocks:**\n`;
+            remainingStocks.forEach(symbol => {
+                stockText += `💼 **${symbol}** - Use \`/price ${symbol}\` for live data\n`;
+            });
         }
 
         if (stocks.length > maxStocks) {
@@ -450,7 +530,7 @@ async function handleBrowse(interaction) {
 
         embed.setDescription(stockText);
         embed.setFooter({ 
-            text: `Use /price <symbol> for detailed info • Use /buy <symbol> <quantity> to trade`
+            text: `Use /price <symbol> for detailed live info • Use /buy <symbol> <quantity> to trade • 0.02% fee applies`
         });
         
         await interaction.editReply({ embeds: [embed] });
